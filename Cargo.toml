@@ -1,0 +1,10 @@
+[package]
+name = "minio-statemap"
+version = "0.1.0"
+authors = ["Kody A Kantor <kody@kkantor.com>"]
+edition = "2018"
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
