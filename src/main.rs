@@ -1,11 +1,16 @@
 extern crate serde_json;
-use serde_json::json;
+extern crate getopts;
 
+use std::env;
 use std::fs;
 use std::convert::TryInto;
 
+use getopts::Options;
+
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use serde_json::{Deserializer, Map, Value};
+
 use chrono::{DateTime, Utc};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -54,53 +59,93 @@ struct StateHeader {
     states: Map<String, Value>,
 }
 
-fn main() -> std::io::Result<()> {
+/*
+ * Parse the MinIO trace data file and print statemap-formatted records to
+ * stdout.
+ */
+fn print_states(filename: &str) -> std::io::Result<()> {
+    let raw_data = fs::read_to_string(filename)?;
 
-    let raw_data = fs::read_to_string("trace_minio")?;
-
-    /* find start time when we unwrap the x value */
-    let t: Vec<TraceData> = Deserializer::from_str(&raw_data).into_iter::<TraceData>().map(|x| x.unwrap()).collect::<Vec<TraceData>>();
-
-    let mut s: String = String::from("");
-    let begin: DateTime<Utc> = Utc::now();
-    let begin_ns: u64 = begin.timestamp_subsec_nanos().into();
-    let mut start: u64 = (begin.timestamp() * 1_000_000_000)
-        .try_into()
-        .expect("failed to make unix timestamp into ns timestamp");
-    start += begin_ns;
+    let mut start: Option<u64> = None;
 
     let mut metamap: Map<String, Value> = Map::new();
     let mut num_states = 0;
-    /*
-     * First find the first event. All of the statemap states times are offsets
-     * from the first event.
-     */
-    for value in &t {
-        let parsed_data = value;
 
-        let end_ns: u64 = parsed_data.time.timestamp_subsec_nanos().into();
-        let unix_end_time: u64 = (parsed_data.time.timestamp() * 1_000_000_000)
+    /*
+     * parse_data receives a callback for every json block that minio reported
+     * and does two things:
+     *   1) Finds the timestamp of the earliest reported event. Statemaps
+     *      require each state timestamp is an offset from the first event.
+     *   2) Finds some state metadata. In MinIO terms this is
+     *      a list of state names (like 'PutObject' or 'ListDir') assigned a
+     *      unique number.
+     *
+     * You may think "why not just look at the first entry in the minio trace
+     * output to find the beginning timestamp instead of interating over the
+     * entire data set?" - A good question!
+     *
+     * MinIO's trace data is sorted by _end_ time of operation, not _start_
+     * time. Further, MinIO doesn't report the start time of each operation.
+     * MinIO only reports the end time of each operation and the duration of
+     * the operation, so we must infer the start time based on this information.
+     */
+    let parse_data= |x: Result<TraceData, serde_json::Error>| {
+        /* Just panic if we see invalid json */
+        let td = x.expect("unexpected json format");
+
+        let end_ns: u64 = td.time.timestamp_subsec_nanos().into();
+        let unix_end_time: u64 = (td.time.timestamp() * 1_000_000_000)
             .try_into()
             .expect("failed to make unix timestamp into ns timestamp");
 
         let end_time_ns = unix_end_time + end_ns;
-        let begin_time_ns = end_time_ns - parsed_data.call_stats.duration;
+        let begin_time_ns = end_time_ns - td.call_stats.duration;
 
-        if begin_time_ns < start {
-            start = begin_time_ns;
+        if start.is_none() || begin_time_ns < start.unwrap() {
+            start = Some(begin_time_ns);
         }
 
-        if !metamap.contains_key(&parsed_data.api.clone()) {
-            metamap.insert(String::from(parsed_data.api.clone()),
+        if !metamap.contains_key(&td.api.clone()) {
+            metamap.insert(String::from(td.api.clone()),
                 json!({ "value": num_states }));
             num_states += 1;
         }
-    }
-    let waiting_state: u64 = num_states;
-    metamap.insert(String::from("waiting"), json!({ "value": &waiting_state, "color": "#FFFFFF" }));
+
+        /* Return the TraceData so it can be collected in a Vec. */
+        td
+    };
 
     /*
-     * Create all of the states now that we have the beginning timestamp.
+     * Convert the file to a vec while finding some key metadata.
+     */
+    let t: Vec<TraceData> = Deserializer::from_str(&raw_data)
+        .into_iter::<TraceData>()
+        .map(parse_data)
+        .collect::<Vec<TraceData>>();
+
+    /* 
+     * When MinIO doesn't say what it's doing we assume it's not doing anything
+     * useful, so we assign the 'waiting' state.
+     */
+    let waiting_state: u64 = num_states;
+    metamap.insert(String::from("waiting"),
+        json!({ "value": &waiting_state, "color": "#FFFFFF" }));
+
+    let header = StateHeader {
+        start: vec![
+            start.unwrap() / 1_000_000_000,
+            start.unwrap() % 1_000_000_000
+        ],
+        title: String::from("minio trace"),
+        host: String::from("myhost"),
+        //entity_kind: String::from("Host"),
+        states: metamap,
+    };
+    println!("{}", serde_json::to_string(&header)?);
+
+    /*
+     * Create all of the states now that we know the beginning timestamp and
+     * the necessary metadata.
      */
     for value in t {
 
@@ -114,8 +159,8 @@ fn main() -> std::io::Result<()> {
         let end_time_ns = unix_end_time + end_ns;
         let begin_time_ns = end_time_ns - parsed_data.call_stats.duration;
 
-        let offset = begin_time_ns - start;
-        let statenum = metamap.get(&parsed_data.api).unwrap();
+        let offset = begin_time_ns - start.unwrap();
+        let statenum = header.states.get(&parsed_data.api).unwrap();
         let statenum = statenum["value"].as_u64().unwrap();
 
         let state = State {
@@ -124,28 +169,53 @@ fn main() -> std::io::Result<()> {
             state: statenum,
         };
 
-        s = format!("{}{}\n", s, serde_json::to_string(&state)?);
+        println!("{}", serde_json::to_string(&state)?);
 
-        let offset = end_time_ns - start;
+        let offset = end_time_ns - start.unwrap();
         let state = State {
             time: offset.to_string(),
             entity: parsed_data.host,
             state: waiting_state,
         };
 
-        s = format!("{}{}\n", s, serde_json::to_string(&state)?);
+        println!("{}", serde_json::to_string(&state)?);
     }
 
-    let header = StateHeader {
-        start: vec![start / 1_000_000_000, start % 1_000_000_000],
-        title: String::from("minio trace"),
-        host: String::from("myhost"),
-        //entity_kind: String::from("Host"),
-        states: metamap,
+    Ok(())
+
+}
+
+fn usage(opts: Options, msg: &str) {
+    let synopsis = "\
+        Convert MinIO JSON trace output to statemap input";
+
+    let usg = format!("minio-statemap - {}", synopsis);
+    let ex_usg = format!("Example usage:\n \
+        ./minio-statemap -i ./my_minio_trace.out | statemap > statemap.svg\n");
+    println!("{}", opts.usage(&usg));
+    println!("{}", ex_usg);
+    println!("{}", msg);
+}
+
+fn main() -> std::io::Result<()> {
+
+    let args: Vec<String> = env::args().collect();
+    let mut opts = Options::new();
+
+    opts.reqopt("i",
+                "input-file",
+                "path to minio trace file to be parsed",
+                "FILE");
+
+    let matches = match opts.parse(&args[1..]) {
+        Ok(m) => m,
+        Err(f) => {
+            usage(opts, &f.to_string());
+            return Ok(())
+        },
     };
 
-    println!("{}", serde_json::to_string(&header)?);
-    println!("{}", s);
+    let ifile = matches.opt_str("input-file").unwrap();
 
-    Ok(())
+    print_states(&ifile)
 }
