@@ -130,7 +130,7 @@ fn print_states(filename: &str, title: &str, cluster: &str)
         }
 
         if !metamap.contains_key(&td.api.clone()) {
-            metamap.insert(String::from(td.api.clone()),
+            metamap.insert(td.api.clone(),
                 json!({ "value": num_states }));
             num_states += 1;
         }
@@ -169,7 +169,7 @@ fn print_states(filename: &str, title: &str, cluster: &str)
             start.unwrap() / 1_000_000_000,
             start.unwrap() % 1_000_000_000
         ],
-        title: title,
+        title,
         host: cluster,
         //entity_kind: String::from("Host"),
         states: metamap,
@@ -271,8 +271,9 @@ fn usage(opts: Options, msg: &str) {
         Convert MinIO JSON trace output to statemap input";
 
     let usg = format!("minio-statemap - {}", synopsis);
-    let ex_usg = format!("Example usage:\n \
-        ./minio-statemap -i ./my_minio_trace.out | statemap > statemap.svg\n");
+    let ex_usg = "Example usage:\n \
+        ./minio-statemap -i ./my_minio_trace.out | statemap > statemap.svg\n"
+        .to_string();
     println!("{}", opts.usage(&usg));
     println!("{}", ex_usg);
     println!("{}", msg);
